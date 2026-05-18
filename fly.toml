@@ -1,0 +1,41 @@
+app = "coval-websocket-agent-tracing-skills-1"
+primary_region = "sjc"
+
+[build]
+
+[env]
+  PUBLIC_BASE_URL = "https://coval-websocket-agent-tracing-skills-1.fly.dev"
+  WS_AGENT_SAMPLE_RATE_HZ = "16000"
+  WS_AGENT_CHANNELS = "1"
+  WS_AGENT_ECHO_THRESHOLD_BYTES = "16000"
+  WS_AGENT_RESPONSE_MODE = "canned_speech"
+  WS_AGENT_CANNED_RESPONSE_LIMIT = "2"
+  WS_AGENT_CANNED_RESPONSE_CHUNK_MS = "100"
+  WS_AGENT_CANNED_TURN_SILENCE_MS = "900"
+  WS_AGENT_CANNED_SILENCE_RMS_THRESHOLD = "250"
+  WS_AGENT_CANNED_FORCE_RESPONSE_BYTES = "1080000"
+  WS_AGENT_SEND_CART_ON_CONNECT = "true"
+  WS_AGENT_SEND_CART_AFTER_FIRST_ECHO = "false"
+  WS_AGENT_SEND_SESSION_READY = "false"
+  WS_AGENT_REQUIRE_AUTH = "false"
+  WS_AGENT_CLOSE_AFTER_ECHOS = "0"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+  max_machines_running = 1
+
+[[http_service.checks]]
+  grace_period = "10s"
+  interval = "30s"
+  method = "GET"
+  path = "/health"
+  timeout = "5s"
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
