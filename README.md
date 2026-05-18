@@ -141,6 +141,10 @@ curl -sS https://coval-websocket-agent-tracing-skills-1.fly.dev/health
 python smoke_client.py wss://coval-websocket-agent-tracing-skills-1.fly.dev/ws
 ```
 
+The remote smoke client sends about 700 ms of audio by default so it crosses the
+deployed agent's response threshold. If you lower `--duration-ms`, also lower
+`WS_AGENT_ECHO_THRESHOLD_BYTES` or `WS_AGENT_CANNED_FORCE_RESPONSE_BYTES`.
+
 ## Coval Agent Metadata
 
 Use the `/config` endpoint for the current canonical payload. The default shape
@@ -180,7 +184,7 @@ All knobs are optional environment variables:
 - `WS_AGENT_CANNED_RESPONSE_CHUNK_MS`: default `100`.
 - `WS_AGENT_CANNED_TURN_SILENCE_MS`: silence gap after inbound audio before a canned response; default `800`.
 - `WS_AGENT_CANNED_SILENCE_RMS_THRESHOLD`: PCM16 RMS value below which inbound audio counts as silence; default `250`.
-- `WS_AGENT_CANNED_FORCE_RESPONSE_BYTES`: optional inbound byte count that forces a canned response even if no silence is detected; default `0`.
+- `WS_AGENT_CANNED_FORCE_RESPONSE_BYTES`: optional inbound byte count that forces a canned response even if no silence is detected; local default `0`; deployed Fly config uses `16000`.
 - `WS_AGENT_SEND_CART_ON_CONNECT`: default `true`.
 - `WS_AGENT_SEND_CART_AFTER_FIRST_ECHO`: default `false`.
 - `WS_AGENT_SEND_SESSION_READY`: default `false`.

@@ -80,7 +80,7 @@ def main() -> None:
     parser.add_argument("--token", default=None)
     parser.add_argument("--sample-rate-hz", type=int, default=16000)
     parser.add_argument("--channels", type=int, default=1)
-    parser.add_argument("--duration-ms", type=int, default=120)
+    parser.add_argument("--duration-ms", type=int, default=700)
     parser.add_argument("--timeout-seconds", type=float, default=5.0)
     args = parser.parse_args()
     asyncio.run(run(args))
