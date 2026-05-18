@@ -23,10 +23,18 @@ import time
 from typing import Any
 from uuid import uuid4
 
+from coval_tracing import clear_session
+from coval_tracing import get_tracer
+from coval_tracing import set_simulation_id
+from coval_tracing import setup_coval_tracing
 from fastapi import FastAPI
 from fastapi import WebSocket
 from fastapi import WebSocketDisconnect
 from fastapi import status
+from opentelemetry import context as otel_context
+from opentelemetry import trace as otel_trace
+from opentelemetry.trace import Status
+from opentelemetry.trace import StatusCode
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -40,6 +48,8 @@ WS_AGENT_OUTBOUND_AUDIO_TEMPLATE = (
 RESPONSE_MODE_ECHO = "echo"
 RESPONSE_MODE_CANNED_SPEECH = "canned_speech"
 DEFAULT_CANNED_AUDIO_PATH = Path(__file__).with_name("assets") / "agent-reply.pcm"
+
+setup_coval_tracing(SERVICE_NAME)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -125,6 +135,7 @@ class SessionState:
     client: str
     max_events: int
     disconnected_at: float | None = None
+    simulation_output_id: str | None = None
     received_audio_messages: int = 0
     received_audio_bytes: int = 0
     sent_audio_messages: int = 0
@@ -144,6 +155,7 @@ class SessionState:
             "agent_id": self.agent_id,
             "connected_at": self.connected_at,
             "disconnected_at": self.disconnected_at,
+            "simulation_output_id": self.simulation_output_id,
             "client": self.client,
             "received_audio_messages": self.received_audio_messages,
             "received_audio_bytes": self.received_audio_bytes,
@@ -210,7 +222,7 @@ def _recommended_coval_metadata(settings: Settings) -> dict[str, Any]:
         "endpoint": f"{websocket_url}/ws",
         "connection_mode": "direct",
         "websocket_compat_profile": "json_audio",
-        "initialization_json": "",
+        "initialization_json": {"simulation_id": "{{simulation_id}}"},
         "send_sample_rate_hertz": settings.sample_rate_hz,
         "receive_sample_rate_hertz": settings.sample_rate_hz,
         "handshake_ready_message_type": "",
@@ -281,7 +293,7 @@ async def _websocket_handler(websocket: WebSocket, agent_id: str) -> None:
 
     await websocket.accept()
     session = SessionState(
-        session_id=f"vb-{uuid4().hex[:12]}",
+        session_id=f"ws-{uuid4().hex[:12]}",
         agent_id=agent_id,
         connected_at=time.time(),
         client=f"{websocket.client.host}:{websocket.client.port}" if websocket.client else "unknown",
@@ -289,6 +301,20 @@ async def _websocket_handler(websocket: WebSocket, agent_id: str) -> None:
     )
     _store_session(session, settings)
     logger.info("WebSocket test WebSocket connected session=%s agent_id=%s", session.session_id, agent_id)
+
+    tracer = get_tracer()
+    conversation_span = tracer.start_span(
+        "conversation",
+        attributes={
+            "session.id": session.session_id,
+            "agent.id": agent_id,
+            "agent.type": "websocket",
+            "transport.provider": "websocket",
+            "audio.sample_rate_hz": settings.sample_rate_hz,
+            "audio.channels": settings.channels,
+        },
+    )
+    context_token = otel_context.attach(otel_trace.set_span_in_context(conversation_span))
 
     audio_buffer = bytearray()
     response_count = 0
@@ -408,9 +434,25 @@ async def _websocket_handler(websocket: WebSocket, agent_id: str) -> None:
                     await websocket.close(code=status.WS_1000_NORMAL_CLOSURE)
                     return
     except WebSocketDisconnect:
+        conversation_span.add_event("websocket.disconnect")
         pass
+    except Exception as exc:
+        conversation_span.record_exception(exc)
+        conversation_span.set_status(Status(StatusCode.ERROR, str(exc)[:200]))
+        raise
     finally:
         session.disconnected_at = time.time()
+        duration_seconds = session.disconnected_at - session.connected_at
+        conversation_span.set_attribute("call.duration_seconds", duration_seconds)
+        conversation_span.set_attribute("audio.input.messages", session.received_audio_messages)
+        conversation_span.set_attribute("audio.input.bytes", session.received_audio_bytes)
+        conversation_span.set_attribute("audio.output.messages", session.sent_audio_messages)
+        conversation_span.set_attribute("audio.output.bytes", session.sent_audio_bytes)
+        conversation_span.set_attribute("non_audio.messages", session.non_audio_messages)
+        if session.simulation_output_id:
+            conversation_span.set_attribute("coval.simulation_output_id", session.simulation_output_id)
+        if session.errors:
+            conversation_span.set_status(Status(StatusCode.ERROR, session.errors[-1][:200]))
         logger.info(
             "WebSocket test WebSocket disconnected session=%s received_audio=%s sent_audio=%s errors=%s",
             session.session_id,
@@ -418,6 +460,9 @@ async def _websocket_handler(websocket: WebSocket, agent_id: str) -> None:
             session.sent_audio_messages,
             len(session.errors),
         )
+        conversation_span.end()
+        otel_context.detach(context_token)
+        clear_session(session.session_id)
 
 
 async def _maybe_send_canned_response(
@@ -438,7 +483,16 @@ async def _maybe_send_canned_response(
     if not canned_audio:
         _record_error(session, f"canned audio not found or empty: {settings.canned_audio_path}")
         return False
-    await _send_audio_stream(websocket, session, canned_audio, settings=settings)
+    with get_tracer().start_as_current_span(
+        "tts",
+        attributes={
+            "session.id": session.session_id,
+            "tts.providerName": "canned_audio",
+            "audio.bytes": len(canned_audio),
+            "metrics.ttfb": 0.0,
+        },
+    ):
+        await _send_audio_stream(websocket, session, canned_audio, settings=settings)
     return True
 
 
@@ -455,6 +509,7 @@ def _is_authorized(websocket: WebSocket, settings: Settings) -> bool:
 def _extract_audio_bytes(incoming: dict[str, Any], session: SessionState) -> bytes | None:
     if incoming.get("bytes") is not None:
         audio_bytes = incoming["bytes"]
+        _record_transport_span(session, direction="in", kind="binary_audio", size_bytes=len(audio_bytes))
         session.add_event(
             SessionEvent(at=time.time(), direction="in", kind="binary_audio", size_bytes=len(audio_bytes))
         )
@@ -469,6 +524,8 @@ def _extract_audio_bytes(incoming: dict[str, Any], session: SessionState) -> byt
     except json.JSONDecodeError as exc:
         _record_error(session, f"invalid_json: {exc}")
         return None
+
+    _maybe_set_simulation_id_from_message(session, message)
 
     action = message.get("action")
     if action != "audio_message":
@@ -489,15 +546,28 @@ def _extract_audio_bytes(incoming: dict[str, Any], session: SessionState) -> byt
         return None
 
     try:
-        return base64.b64decode(audio_data, validate=True)
+        audio_bytes = base64.b64decode(audio_data, validate=True)
     except (binascii.Error, ValueError) as exc:
         _record_error(session, f"invalid audio_bytes base64: {exc}")
         return None
+    _record_transport_span(session, direction="in", kind="audio_message", size_bytes=len(audio_bytes))
+    return audio_bytes
 
 
 async def _send_audio(websocket: WebSocket, session: SessionState, audio_bytes: bytes, *, settings: Settings) -> None:
-    message = _audio_message(audio_bytes)
-    await _send_json(websocket, session, message, kind="audio_message", size_bytes=len(audio_bytes))
+    with get_tracer().start_as_current_span(
+        "transport",
+        attributes={
+            "session.id": session.session_id,
+            "transport.direction": "out",
+            "message.type": "audio_message",
+            "audio.bytes": len(audio_bytes),
+            "audio.sample_rate_hz": settings.sample_rate_hz,
+            "audio.channels": settings.channels,
+        },
+    ):
+        message = _audio_message(audio_bytes)
+        await _send_json(websocket, session, message, kind="audio_message", size_bytes=len(audio_bytes))
     session.sent_audio_messages += 1
     session.sent_audio_bytes += len(audio_bytes)
     session.add_event(
@@ -531,7 +601,19 @@ async def _send_json(
     kind: str,
     size_bytes: int = 0,
 ) -> None:
-    await websocket.send_text(json.dumps(message, separators=(",", ":")))
+    if kind == "cart_updated":
+        with get_tracer().start_as_current_span(
+            "llm_tool_call",
+            attributes={
+                "session.id": session.session_id,
+                "function.name": "emit_cart_update",
+                "tool.result.success": True,
+                "cart.total": float(message.get("data", {}).get("total", 0.0)),
+            },
+        ):
+            await websocket.send_text(json.dumps(message, separators=(",", ":")))
+    else:
+        await websocket.send_text(json.dumps(message, separators=(",", ":")))
     if kind != "audio_message":
         session.add_event(SessionEvent(at=time.time(), direction="out", kind=kind, size_bytes=size_bytes))
 
@@ -610,3 +692,56 @@ def _record_error(session: SessionState, message: str) -> None:
     session.errors.append(message)
     session.add_event(SessionEvent(at=time.time(), direction="in", kind="error", detail={"message": message}))
     logger.warning("WebSocket test session=%s error=%s", session.session_id, message)
+
+
+def _maybe_set_simulation_id_from_message(session: SessionState, message: dict[str, Any]) -> None:
+    if session.simulation_output_id:
+        return
+
+    simulation_id = _first_string_path(
+        message,
+        (
+            "simulation_id",
+            "simulation_output_id",
+            "session_id",
+            "coval.simulation_id",
+            "coval.simulation_output_id",
+            "metadata.simulation_id",
+            "metadata.simulation_output_id",
+        ),
+    )
+    if not simulation_id:
+        return
+
+    session.simulation_output_id = simulation_id
+    set_simulation_id(session.session_id, simulation_id)
+    current_span = otel_trace.get_current_span()
+    current_span.set_attribute("coval.simulation_output_id", simulation_id)
+    current_span.add_event("coval.simulation_id_received")
+    logger.info("Coval simulation ID received session=%s simulation_id=%s", session.session_id, simulation_id)
+
+
+def _first_string_path(message: dict[str, Any], paths: tuple[str, ...]) -> str:
+    for path in paths:
+        value: Any = message
+        for part in path.split("."):
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(part)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _record_transport_span(session: SessionState, *, direction: str, kind: str, size_bytes: int) -> None:
+    with get_tracer().start_as_current_span(
+        "transport",
+        attributes={
+            "session.id": session.session_id,
+            "transport.direction": direction,
+            "message.type": kind,
+            "audio.bytes": size_bytes,
+        },
+    ):
+        pass

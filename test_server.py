@@ -32,6 +32,7 @@ def test_health_and_config():
     metadata = config["recommended_coval_metadata"]
     assert metadata["model_type"] == "MODEL_TYPE_WEBSOCKET"
     assert metadata["websocket_compat_profile"] == "json_audio"
+    assert metadata["initialization_json"] == {"simulation_id": "{{simulation_id}}"}
     assert metadata["message_type_path"] == "action"
     assert metadata["audio_data_path"] == "audio_bytes"
     assert metadata["receive_audio_channels"] == 1
@@ -111,11 +112,13 @@ def test_websocket_can_force_canned_response_without_silence(monkeypatch):
 def test_websocket_records_non_audio_messages():
     with client.websocket_connect("/ws/test-agent") as websocket:
         websocket.receive_json()
+        websocket.send_json({"simulation_id": "sim-test-123"})
         websocket.send_json({"action": "system_notify", "payload": {}, "event": "ocb:cart-updated", "data": {}})
 
     session = client.get("/sessions").json()["sessions"][0]
     assert session["agent_id"] == "test-agent"
-    assert session["non_audio_messages"] == 1
+    assert session["simulation_output_id"] == "sim-test-123"
+    assert session["non_audio_messages"] == 2
 
 
 def test_invalid_audio_base64_is_recorded():

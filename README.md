@@ -4,9 +4,9 @@ Always-on protocol harness for Coval's generic JSON-audio WebSocket simulator.
 It lets `MODEL_TYPE_WEBSOCKET` simulations exercise a deterministic voice agent
 without depending on any customer service.
 
-This baseline intentionally has no OpenTelemetry or Coval trace instrumentation.
-It exists so the Coval external tracing skills can be applied and validated
-against a clean agent.
+The first commit in this repo intentionally had no OpenTelemetry or Coval trace
+instrumentation. The current version was instrumented by following Coval's
+external `setup-tracing` skill.
 
 ## Protocol Summary
 
@@ -28,7 +28,7 @@ against a clean agent.
 - `wss://.../ws` direct WebSocket connection.
 - Optional Bearer auth via header or `?token=` query param when
   `WS_AGENT_REQUIRE_AUTH=true`.
-- No initialization payload by default.
+- Coval sends initialization JSON containing the simulation output ID.
 - No `session_ready` handshake by default.
 - Inbound JSON audio frames from Coval:
 
@@ -152,7 +152,7 @@ is:
   "endpoint": "wss://coval-websocket-agent-tracing-skills-1.fly.dev/ws",
   "connection_mode": "direct",
   "websocket_compat_profile": "json_audio",
-  "initialization_json": "",
+  "initialization_json": {"simulation_id": "{{simulation_id}}"},
   "send_sample_rate_hertz": 16000,
   "receive_sample_rate_hertz": 16000,
   "handshake_ready_message_type": "",
@@ -188,9 +188,17 @@ All knobs are optional environment variables:
 - `WS_AGENT_REQUIRE_AUTH`: default `false`.
 - `WS_AGENT_AUTH_TOKEN`: bearer/query token when auth is enabled.
 - `WS_AGENT_CLOSE_AFTER_ECHOS`: default `0`, meaning keep connection open.
+- `COVAL_API_KEY`: Coval organization API key with trace write access.
+- `COVAL_TRACES_ENDPOINT`: optional override, default
+  `https://api.coval.dev/v1/traces`.
 
 ## Validation Intent
 
-The first commit in this repo is the uninstrumented baseline. Subsequent commits
-show the changes made by applying Coval's external tracing skills, then running a
-live Coval simulation and checking trace ingestion.
+The baseline commit is uninstrumented. The tracing commit adds:
+
+- `conversation` root spans for each WebSocket session.
+- `transport` spans for inbound and outbound audio frames.
+- `tts` spans for canned audio responses.
+- `llm_tool_call` spans for structured cart updates.
+- Simulation correlation from Coval's initialization JSON:
+  `{"simulation_id":"{{simulation_id}}"}`.
